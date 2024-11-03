@@ -3,6 +3,8 @@ package picocache
 import (
 	"crypto/sha256"
 	"encoding/base32"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -15,14 +17,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 type cacheEntry struct {
-	filename    string
-	size        int64
-	lastUsed    time.Time
-	beingCached sync.RWMutex
+	filename string
+	size     int64
+	lastUsed time.Time
 }
 
 type PicoCache struct {
@@ -32,6 +34,8 @@ type PicoCache struct {
 	maxCacheSize int64
 	entries      sync.Map
 	totalSize    atomic.Int64
+	downloading  sync.Map   // Track ongoing downloads
+	cleanupMutex sync.Mutex // Prevent concurrent cleanups
 }
 
 func NewCache(logger *slog.Logger, source string, cacheDir string, maxCacheSize int64) (*PicoCache, error) {
@@ -41,6 +45,7 @@ func NewCache(logger *slog.Logger, source string, cacheDir string, maxCacheSize 
 		cacheDir:     cacheDir,
 		maxCacheSize: maxCacheSize,
 		entries:      sync.Map{},
+		downloading:  sync.Map{},
 	}
 
 	cache.log.Info("Creating cache folder if it doesn't exists...")
@@ -48,7 +53,7 @@ func NewCache(logger *slog.Logger, source string, cacheDir string, maxCacheSize 
 		return nil, err
 	}
 
-	cache.log.Info("Rebuilding index with already exisiting cache entries...")
+	cache.log.Info("Rebuilding index with already existing cache entries...")
 	if err := cache.rebuildCache(); err != nil {
 		return nil, err
 	}
@@ -67,6 +72,17 @@ func (c *PicoCache) getCacheFilename(r *http.Request) string {
 }
 
 func (c *PicoCache) cleanupOldEntries() {
+	if !c.cleanupMutex.TryLock() {
+		return
+	}
+	defer c.cleanupMutex.Unlock()
+
+	if c.totalSize.Load() < c.maxCacheSize {
+		return
+	}
+
+	c.log.Info("Starting cache cleanup...")
+
 	type entryWithURL struct {
 		filename string
 		entry    *cacheEntry
@@ -85,13 +101,22 @@ func (c *PicoCache) cleanupOldEntries() {
 		return +1
 	})
 
+	removedCount := 0
+	removedSize := int64(0)
 	for _, e := range sortedEntries {
 		os.Remove(e.entry.filename)
 		c.entries.Delete(e.filename)
+		removedSize += e.entry.size
+		removedCount++
 		if c.totalSize.Add(-e.entry.size) <= c.maxCacheSize {
 			break
 		}
 	}
+
+	c.log.Info("Cache cleanup completed",
+		slog.Int("removed_files", removedCount),
+		slog.Int64("removed_size", removedSize),
+		slog.Int64("current_size", c.totalSize.Load()))
 }
 
 func (c *PicoCache) rebuildCache() error {
@@ -123,11 +148,72 @@ func (c *PicoCache) rebuildCache() error {
 		return err
 	}
 
-	if c.totalSize.Load() > c.maxCacheSize {
-		c.cleanupOldEntries()
-	}
+	go c.cleanupOldEntries()
 
 	return nil
+}
+
+func (c *PicoCache) downloadFile(url string, cacheFile string) (*cacheEntry, error) {
+	// Check if download is already in progress
+	if _, exists := c.downloading.LoadOrStore(cacheFile, true); exists {
+		// Wait for other download to complete
+		for {
+			if entry, ok := c.entries.Load(cacheFile); ok {
+				c.downloading.Delete(cacheFile)
+				return entry.(*cacheEntry), nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	defer c.downloading.Delete(cacheFile)
+
+	// Try download up to 3 times
+	for attempts := 0; attempts < 3; attempts++ {
+		resp, err := http.Get(url)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("source returned status %d", resp.StatusCode)
+		}
+
+		tempFile := cacheFile + ".tmp"
+		file, err := os.Create(tempFile)
+		if err != nil {
+			return nil, err
+		}
+
+		n, err := io.Copy(file, resp.Body)
+		file.Close()
+
+		if err != nil || n != resp.ContentLength {
+			os.Remove(tempFile)
+			continue
+		}
+
+		err = os.Rename(tempFile, cacheFile)
+		if err != nil {
+			os.Remove(tempFile)
+			return nil, err
+		}
+
+		entry := &cacheEntry{
+			filename: cacheFile,
+			size:     resp.ContentLength,
+			lastUsed: time.Now(),
+		}
+		c.entries.Store(cacheFile, entry)
+
+		c.totalSize.Add(resp.ContentLength)
+
+		go c.cleanupOldEntries() // Run cleanup in background if needed
+
+		return entry, nil
+	}
+
+	return nil, fmt.Errorf("failed to download file after 3 attempts")
 }
 
 func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -141,96 +227,152 @@ func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log := c.log.With(slog.String("url", r.URL.Path))
-
 	cacheFile := c.getCacheFilename(r)
 
 	header := w.Header()
 	header.Set("X-Cache", "MISS")
 	header.Set("Cache-Control", "public, max-age=604800, immutable")
 	header.Set("Content-Type", mime.TypeByExtension(filepath.Ext(r.URL.Path)))
-	header.Set("ETag", filepath.Base(cacheFile))
+	header.Set("Accept-Ranges", "bytes")
+	etag := filepath.Base(cacheFile)
+	header.Set("ETag", etag)
 
-	if r.Header.Get("If-None-Match") == header.Get("ETag") {
-		log.Info("ETag is the same as If-None-Match, returning 304")
+	if match := r.Header.Get("If-None-Match"); match != "" &&
+		strings.EqualFold(match, etag) {
+
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
+	var entry *cacheEntry
 	if e, ok := c.entries.Load(cacheFile); ok {
-		entry := e.(*cacheEntry)
-
-		// Wait for the file to be fully cached before sending it
-		entry.beingCached.RLock()
-		defer entry.beingCached.RUnlock()
-
-		cachedFile, err := os.Open(entry.filename)
-		if err == nil {
-			log.Info("Cache hit")
-			header.Set("X-Cache", "HIT")
-			header.Set("Content-Length", strconv.FormatInt(entry.size, 10))
-			defer cachedFile.Close()
-			_, err := io.Copy(w, cachedFile)
-			if err == nil {
-				go func() {
-					now := time.Now()
-					os.Chtimes(entry.filename, now, now)
-					entry.lastUsed = now
-				}()
-				return
-			}
-			log.Error("Failed to stream cached file", slog.String("err", err.Error()))
-		} else {
-			log.Error("Failed to open cached file", slog.String("err", err.Error()))
+		entry = e.(*cacheEntry)
+		header.Set("X-Cache", "HIT")
+	} else {
+		var err error
+		entry, err = c.downloadFile(c.source+r.URL.Path, cacheFile)
+		if err != nil {
+			log.Error("Failed to download file", slog.String("err", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	}
 
-	log.Info("Cache miss")
-	resp, err := http.Get(c.source + r.URL.Path)
+	file, err := os.Open(entry.filename)
 	if err != nil {
-		log.Error("Error from source", slog.Int("statuscode", resp.StatusCode))
+		log.Error("Failed to open cached file", slog.String("err", err.Error()))
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer resp.Body.Close()
+	defer file.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		log.Error("Source not returning 200", slog.Int("statuscode", resp.StatusCode))
-		w.WriteHeader(http.StatusNotFound)
+	var fileReader io.Reader
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		// Handle ranged request
+		rang, err := parseRange(rangeHeader, entry.size)
+		if err != nil {
+			log.Debug("Error parsing range", slog.String("err", err.Error()), slog.String("rangeHeader", rangeHeader))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		if _, err := file.Seek(rang.start, io.SeekStart); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rang.start, rang.end, entry.size))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", rang.end-rang.start+1))
+		w.WriteHeader(http.StatusPartialContent)
+
+		fileReader = io.LimitReader(file, rang.end-rang.start+1)
+	} else {
+		fileReader = file
+	}
+
+	if _, err := io.Copy(&writerClientError{w}, fileReader); err != nil &&
+		!(errors.Is(err, errClientError) && (errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET))) {
+
+		log.Error("Failed to stream file", slog.String("err", err.Error()))
 		return
 	}
 
-	header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	// Update last used time
+	now := time.Now()
+	os.Chtimes(entry.filename, now, now)
+	entry.lastUsed = now
+}
 
-	newEntry := &cacheEntry{
-		filename:    cacheFile,
-		size:        resp.ContentLength,
-		lastUsed:    time.Now(),
-		beingCached: sync.RWMutex{},
-	}
+var errClientError = errors.New("client error")
 
-	// Write lock so requests trying to read the
-	// same file will wait for it to be cached
-	newEntry.beingCached.Lock()
-	defer newEntry.beingCached.Unlock()
+type writerClientError struct {
+	http.ResponseWriter
+}
 
-	c.entries.Store(cacheFile, newEntry)
-
-	newFile, err := os.Create(cacheFile)
+func (rcr *writerClientError) Write(p []byte) (n int, err error) {
+	n, err = rcr.ResponseWriter.Write(p)
 	if err != nil {
-		log.Error("Error creating cache file", slog.String("err", err.Error()))
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+		err = errors.Join(errClientError, err)
 	}
-	defer newFile.Close()
+	return
+}
 
-	if n, err := io.Copy(io.MultiWriter(newFile, w), resp.Body); err != nil || int64(n) != resp.ContentLength {
-		log.Error("Error serving request", slog.String("err", err.Error()), slog.Int64("expectedSize", resp.ContentLength), slog.Int64("transferedSize", n))
-		w.WriteHeader(http.StatusInternalServerError)
-		os.Remove(cacheFile)
-		return
+type httpRange struct {
+	start, end int64
+}
+
+// parseRange parses a Range header string as per RFC 7233.
+func parseRange(s string, size int64) (*httpRange, error) {
+	ra, exist := strings.CutPrefix(s, "bytes=")
+	if !exist {
+		return nil, fmt.Errorf("invalid range prefix")
 	}
 
-	if c.totalSize.Add(resp.ContentLength) > c.maxCacheSize {
-		c.cleanupOldEntries()
+	start, end, found := strings.Cut(ra, "-")
+	if !found {
+		return nil, fmt.Errorf("invalid range: no hyphen found")
 	}
+
+	r := &httpRange{}
+
+	if start == "" {
+		// Suffix range: -N means last N bytes
+		i, err := strconv.ParseInt(end, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid range suffix format")
+		}
+		if i > size {
+			i = size
+		}
+		r.start = size - i
+		r.end = size - 1
+	} else {
+		// Normal range: N- or N-M
+		i, err := strconv.ParseInt(start, 10, 64)
+		if err != nil || i < 0 {
+			return nil, fmt.Errorf("invalid range start format")
+		}
+		r.start = i
+
+		if end == "" {
+			// No end specified, go to end of file
+			r.end = size - 1
+		} else {
+			i, err := strconv.ParseInt(end, 10, 64)
+			if err != nil || r.start > i {
+				return nil, fmt.Errorf("invalid range end format")
+			}
+			r.end = i
+		}
+	}
+
+	// Check if range is valid
+	if r.start >= size {
+		return nil, fmt.Errorf("invalid range: start position exceeds content size")
+	}
+	if r.end >= size {
+		r.end = size - 1
+	}
+
+	return r, nil
 }
