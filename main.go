@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,24 +18,24 @@ const envListenTo = "PICOCACHE_LISTENTO"
 func main() {
 	source := os.Getenv(envSource)
 	if source == "" {
-		panic(envSource + " is empty")
+		log.Fatalln(envSource + " is empty")
 	}
 	cacheDir := os.Getenv(envCachedir)
 	if cacheDir == "" {
-		panic(envCachedir + " is empty")
+		log.Fatalln(envCachedir + " is empty")
 	}
 	maxSize := os.Getenv(envMaxSize)
 	if maxSize == "" {
-		panic(envMaxSize + " is empty")
+		log.Fatalln(envMaxSize + " is empty")
 	}
 	listenTo := os.Getenv(envListenTo)
 	if maxSize == "" {
-		panic(envListenTo + " is empty")
+		log.Fatalln(envListenTo + " is empty")
 	}
 
 	size, err := units.FromHumanSize(maxSize)
 	if err != nil {
-		panic("can't parse PICOCACHE_MAXSIZE: " + err.Error())
+		log.Fatalln("can't parse PICOCACHE_MAXSIZE: " + err.Error())
 	}
 
 	pcache, err := picocache.NewCache(
