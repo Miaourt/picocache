@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -229,17 +230,38 @@ func (c *PicoCache) downloadFile(url string, cacheFile string) (*cacheEntry, err
 	return nil, fmt.Errorf("failed to download file after %d attempts", downloadRetries)
 }
 
+func stripPort(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
 func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	log := c.log.With(
+		slog.String("url", r.URL.Path),
+		slog.String("ip", stripPort(r.RemoteAddr)),
+	)
+	if ua := r.Header.Get("User-Agent"); ua != "" {
+		log = log.With(slog.String("ua", ua))
+	}
+	defer func() {
+		log = log.With(slog.Duration("dur", time.Since(start)))
+		log.Info("request")
+	}()
+
 	if r.Method != http.MethodGet {
+		log = log.With(slog.Int("status", http.StatusMethodNotAllowed))
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	if r.URL.Path == "/favicon.ico" || r.URL.Path == "/" {
+		log = log.With(slog.Int("status", http.StatusNotFound))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	log := c.log.With(slog.String("url", r.URL.Path))
 	cacheFile := c.getCacheFilename(r)
 
 	header := w.Header()
@@ -253,6 +275,7 @@ func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if match := r.Header.Get("If-None-Match"); match != "" &&
 		strings.EqualFold(match, etag) {
 
+		log = log.With(slog.String("cache", "HIT"), slog.Int("status", http.StatusNotModified))
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -260,12 +283,15 @@ func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var entry *cacheEntry
 	if e, ok := c.entries.Load(cacheFile); ok {
 		entry = e.(*cacheEntry)
+		log = log.With(slog.String("cache", "HIT"))
 		header.Set("X-Cache", "HIT")
 	} else {
+		log = log.With(slog.String("cache", "MISS"))
 		var err error
 		entry, err = c.downloadFile(c.source+r.URL.Path, cacheFile)
 		if err != nil {
 			log.Error("Failed to download file", slog.String("err", err.Error()))
+			log = log.With(slog.Int("status", http.StatusInternalServerError))
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -274,6 +300,7 @@ func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	file, err := os.Open(entry.filename)
 	if err != nil {
 		log.Error("Failed to open cached file", slog.String("err", err.Error()))
+		log = log.With(slog.Int("status", http.StatusInternalServerError))
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -285,27 +312,32 @@ func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rang, err := parseRange(rangeHeader, entry.size)
 		if err != nil {
 			log.Debug("Error parsing range", slog.String("err", err.Error()), slog.String("rangeHeader", rangeHeader))
+			log = log.With(slog.Int("status", http.StatusRequestedRangeNotSatisfiable))
 			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
 
 		if _, err := file.Seek(rang.start, io.SeekStart); err != nil {
+			log = log.With(slog.Int("status", http.StatusInternalServerError))
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rang.start, rang.end, entry.size))
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", rang.end-rang.start+1))
+		log = log.With(slog.Int("status", http.StatusPartialContent))
 		w.WriteHeader(http.StatusPartialContent)
 
 		fileReader = io.LimitReader(file, rang.end-rang.start+1)
 	} else {
+		log = log.With(slog.Int("status", http.StatusOK))
 		fileReader = file
 	}
 
-	if _, err := io.Copy(&writerClientError{w}, fileReader); err != nil &&
-		!(errors.Is(err, errClientError) && (errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET))) {
-
+	log = log.With(slog.Duration("ttfb", time.Since(start)))
+	n, err := io.Copy(&writerClientError{w}, fileReader)
+	log = log.With(slog.Int64("bytes", n))
+	if err != nil && !(errors.Is(err, errClientError) && (errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET))) {
 		log.Error("Failed to stream file", slog.String("err", err.Error()))
 		return
 	}
