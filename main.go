@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"os"
 	picocache "picocache/src"
-
-	"github.com/docker/go-units"
 )
 
 const envSource = "PICOCACHE_SRC"
@@ -33,7 +31,7 @@ func main() {
 		log.Fatalln(envListenTo + " is empty")
 	}
 
-	size, err := units.FromHumanSize(maxSize)
+	size, err := picocache.ParseSize(maxSize)
 	if err != nil {
 		log.Fatalln("can't parse PICOCACHE_MAXSIZE: " + err.Error())
 	}
