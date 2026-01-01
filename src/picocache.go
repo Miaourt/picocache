@@ -21,6 +21,13 @@ import (
 	"time"
 )
 
+const (
+	downloadRetries      = 3
+	downloadWaitInterval = 100 * time.Millisecond
+	downloadWaitTimeout  = 3 * time.Second
+	cacheMaxAge          = 604800 // 7 days in seconds
+)
+
 type cacheEntry struct {
 	filename string
 	size     int64
@@ -130,6 +137,11 @@ func (c *PicoCache) rebuildCache() error {
 			return nil
 		}
 
+		if strings.HasSuffix(path, ".tmp") {
+			os.Remove(path)
+			return nil
+		}
+
 		info, err := d.Info()
 		if err != nil {
 			return err
@@ -156,19 +168,20 @@ func (c *PicoCache) rebuildCache() error {
 func (c *PicoCache) downloadFile(url string, cacheFile string) (*cacheEntry, error) {
 	// Check if download is already in progress
 	if _, exists := c.downloading.LoadOrStore(cacheFile, true); exists {
-		// Wait for other download to complete
-		for {
+		// Wait for other download to complete with timeout
+		deadline := time.Now().Add(downloadWaitTimeout)
+		for time.Now().Before(deadline) {
 			if entry, ok := c.entries.Load(cacheFile); ok {
 				c.downloading.Delete(cacheFile)
 				return entry.(*cacheEntry), nil
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(downloadWaitInterval)
 		}
+		return nil, fmt.Errorf("timeout waiting for concurrent download")
 	}
 	defer c.downloading.Delete(cacheFile)
 
-	// Try download up to 3 times
-	for attempts := 0; attempts < 3; attempts++ {
+	for attempts := 0; attempts < downloadRetries; attempts++ {
 		resp, err := http.Get(url)
 		if err != nil {
 			continue
@@ -176,7 +189,7 @@ func (c *PicoCache) downloadFile(url string, cacheFile string) (*cacheEntry, err
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("source returned status %d", resp.StatusCode)
+			continue
 		}
 
 		tempFile := cacheFile + ".tmp"
@@ -208,12 +221,12 @@ func (c *PicoCache) downloadFile(url string, cacheFile string) (*cacheEntry, err
 
 		c.totalSize.Add(resp.ContentLength)
 
-		go c.cleanupOldEntries() // Run cleanup in background if needed
+		go c.cleanupOldEntries()
 
 		return entry, nil
 	}
 
-	return nil, fmt.Errorf("failed to download file after 3 attempts")
+	return nil, fmt.Errorf("failed to download file after %d attempts", downloadRetries)
 }
 
 func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +244,7 @@ func (c *PicoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	header := w.Header()
 	header.Set("X-Cache", "MISS")
-	header.Set("Cache-Control", "public, max-age=604800, immutable")
+	header.Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", cacheMaxAge))
 	header.Set("Content-Type", mime.TypeByExtension(filepath.Ext(r.URL.Path)))
 	header.Set("Accept-Ranges", "bytes")
 	etag := filepath.Base(cacheFile)

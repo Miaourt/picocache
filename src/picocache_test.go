@@ -386,3 +386,181 @@ func TestConcurrentDownloads(t *testing.T) {
 		t.Errorf("expected 1 download, got %d", downloadCount.Load())
 	}
 }
+
+func TestConcurrentDownloads_Timeout(t *testing.T) {
+	// Source server that delays response
+	firstRequest := make(chan struct{})
+	sourceServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-firstRequest:
+		default:
+			close(firstRequest)
+		}
+		// Delay longer than the downloadWaitTimeout (3s)
+		time.Sleep(10 * time.Second)
+		w.Write([]byte("content"))
+	}))
+	sourceServer.Config.ReadHeaderTimeout = 0
+	sourceServer.Start()
+	defer sourceServer.Close()
+
+	cache, err := picocache.NewCache(slog.Default(), sourceServer.URL, t.TempDir(), 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(cache)
+	defer server.Close()
+
+	// Start first request that will take a long time
+	go func() {
+		resp, err := server.Client().Get(server.URL + "/file.txt")
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	// Wait for first request to reach source
+	<-firstRequest
+	time.Sleep(50 * time.Millisecond) // Ensure download is registered
+
+	// Second concurrent request should timeout (3s), not wait for first to complete (10s)
+	start := time.Now()
+	resp, err := server.Client().Get(server.URL + "/file.txt")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		resp.Body.Close()
+	}
+
+	// Should complete in ~3s (timeout), not ~10s (waiting for first download)
+	if elapsed > 5*time.Second {
+		t.Fatalf("request took too long: %v (expected ~3s timeout)", elapsed)
+	}
+	if elapsed < 2*time.Second {
+		t.Fatalf("request completed too quickly: %v (should have waited for timeout)", elapsed)
+	}
+}
+
+func TestDownloadFile_RetryBehavior(t *testing.T) {
+	var requestCount atomic.Int32
+
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := requestCount.Add(1)
+		if count < 3 {
+			// Fail first 2 requests
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// Third request succeeds
+		w.Write([]byte("success"))
+	}))
+	defer sourceServer.Close()
+
+	cache, err := picocache.NewCache(slog.Default(), sourceServer.URL, t.TempDir(), 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(cache)
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL + "/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Should eventually succeed after retries
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200 after retries, got %d", resp.StatusCode)
+	}
+	if string(body) != "success" {
+		t.Errorf("expected body 'success', got '%s'", body)
+	}
+	if requestCount.Load() != 3 {
+		t.Errorf("expected 3 requests (2 failures + 1 success), got %d", requestCount.Load())
+	}
+}
+
+func TestRebuildCache_TmpFiles(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	// Create a .tmp file (simulating incomplete download from previous run)
+	tmpFile := filepath.Join(cacheDir, "incomplete.tmp")
+	if err := os.WriteFile(tmpFile, []byte("incomplete"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a valid cached file
+	validFile := filepath.Join(cacheDir, "valid")
+	if err := os.WriteFile(validFile, []byte("valid"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("from source"))
+	}))
+	defer sourceServer.Close()
+
+	// Create cache - should clean up .tmp files
+	_, err := picocache.NewCache(slog.Default(), sourceServer.URL, cacheDir, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// .tmp file should be removed
+	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
+		t.Error("expected .tmp file to be removed during rebuild")
+	}
+
+	// Valid file should still exist
+	if _, err := os.Stat(validFile); err != nil {
+		t.Error("expected valid file to still exist")
+	}
+}
+
+func TestCleanupOldEntries_RemoveError(t *testing.T) {
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("0123456789")) // 10 bytes
+	}))
+	defer sourceServer.Close()
+
+	cacheDir := t.TempDir()
+	// Cache with max size of 15 bytes (fits 1 file but not 2)
+	cache, err := picocache.NewCache(slog.Default(), sourceServer.URL, cacheDir, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(cache)
+	defer server.Close()
+
+	// Cache first file
+	resp1, err := server.Client().Get(server.URL + "/file1.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	// Manually delete the cached file to simulate fs error during cleanup
+	entries, _ := os.ReadDir(cacheDir)
+	for _, e := range entries {
+		os.Remove(filepath.Join(cacheDir, e.Name()))
+	}
+
+	// Request second file - triggers cleanup which should handle missing file gracefully
+	resp2, err := server.Client().Get(server.URL + "/file2.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	// Second file should succeed despite cleanup error
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp2.StatusCode)
+	}
+}

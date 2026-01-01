@@ -29,7 +29,7 @@ func main() {
 		log.Fatalln(envMaxSize + " is empty")
 	}
 	listenTo := os.Getenv(envListenTo)
-	if maxSize == "" {
+	if listenTo == "" {
 		log.Fatalln(envListenTo + " is empty")
 	}
 
@@ -45,7 +45,7 @@ func main() {
 		size,
 	)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	http.ListenAndServe(listenTo, pcache)
